@@ -1,0 +1,61 @@
+[package]
+name = "ego-bridge"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+description = "Share one machine's ego lite browser with agents on other machines over MCP (Streamable HTTP), with a drop-in ego-browser client."
+license = "MIT"
+repository = "https://github.com/nguyenvanduocit/ego-bridge"
+readme = "README.md"
+keywords = ["mcp", "browser", "automation", "ego-lite", "agent"]
+categories = ["command-line-utilities", "web-programming"]
+
+[[bin]]
+name = "ego-bridge"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+axum = "0.8"
+base64 = "0.22"
+clap = { version = "4", features = ["derive", "env"] }
+http = "1"
+humantime = "2"
+rand = "0.9"
+rmcp = { version = "3.8.0", default-features = false, features = [
+    "server",
+    "client",
+    "macros",
+    "transport-streamable-http-server",
+    "transport-streamable-http-client-reqwest",
+    "reqwest",
+] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+thiserror = "2"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "process", "io-util", "fs", "time", "signal", "sync", "net"] }
+tokio-util = "0.7"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+walkdir = "2"
+
+[dev-dependencies]
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
+tempfile = "3"
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+todo = "deny"
+unimplemented = "deny"
+dbg_macro = "deny"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true
