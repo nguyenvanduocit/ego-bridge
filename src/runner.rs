@@ -211,8 +211,9 @@ impl EgoBrowser {
 async fn kill_group(child: &mut tokio::process::Child) {
     if let Some(pid) = child.id() {
         // Signal the whole group so helpers ego-browser started die with it.
+        // POSIX form; procps `kill` would read a bare `-<pid>` as a signal.
         let _ = Command::new("kill")
-            .arg("-KILL")
+            .args(["-s", "KILL", "--"])
             .arg(format!("-{pid}"))
             .status()
             .await;
