@@ -66,11 +66,11 @@ back, however the path was built.
 ## Install
 
 Download a release archive for your platform from
-[Releases](../../releases) (macOS arm64/x86_64, Linux x86_64/arm64 static), or
-build from source:
+[Releases](https://github.com/nguyenvanduocit/ego-bridge/releases) (macOS
+arm64/x86_64, Linux x86_64/arm64 static), or build with Cargo (Rust 1.89+):
 
 ```sh
-cargo install --git https://github.com/nguyenvanduocit/ego-bridge --locked
+cargo install ego-bridge --locked
 ```
 
 The same `ego-bridge` binary is the server and the client.

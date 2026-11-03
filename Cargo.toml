@@ -2,7 +2,7 @@
 name = "ego-bridge"
 version = "0.2.0"
 edition = "2024"
-rust-version = "1.88"
+rust-version = "1.89"
 description = "Share one machine's ego lite browser with agents on other machines over MCP (Streamable HTTP), with a drop-in ego-browser client."
 license = "MIT"
 repository = "https://github.com/nguyenvanduocit/ego-bridge"
