@@ -1,5 +1,21 @@
 # Changelog
 
+## v0.2.0
+
+- Scripts with static `import`/`export` now get mapped file paths too:
+  `import { writeFileSync } from "node:fs"` previously reached the host's real
+  filesystem.
+- A hashbang line and a leading `"use strict"` directive keep working.
+- Stopping the client (Ctrl-C, lost connection) cancels the run on the host.
+  The MCP endpoint is now stateless.
+- Every process a run started is killed when it ends (with `killpg`, no
+  external `kill`), so a background process can no longer hang a run.
+- Output files are size-checked before being read; a run slot is taken before
+  input files are written; `timeout_ms: 0` is rejected; time-limit messages
+  show the exact limit.
+- `service install` pins `EGO_BRIDGE_HOME` in the LaunchAgent, so the service
+  reads the same tokens as the CLI that installed it.
+
 ## v0.1.0
 
 First release.

@@ -4,6 +4,8 @@
 
 use std::path::{Path, PathBuf};
 
+use crate::config::HOME_ENV;
+
 pub const LABEL: &str = "io.github.nguyenvanduocit.ego-bridge";
 
 fn xml_escape(text: &str) -> String {
@@ -13,8 +15,10 @@ fn xml_escape(text: &str) -> String {
         .replace('"', "&quot;")
 }
 
-/// The LaunchAgent property list for `program serve <serve_args...>`.
-pub fn plist(program: &Path, serve_args: &[String], log_path: &Path) -> String {
+/// The LaunchAgent property list for `program serve <serve_args...>`, with
+/// `EGO_BRIDGE_HOME` pinned so the service reads the same tokens as the CLI
+/// that installed it.
+pub fn plist(program: &Path, serve_args: &[String], home: &Path, log_path: &Path) -> String {
     let mut arguments = vec![program.to_string_lossy().into_owned(), "serve".to_owned()];
     arguments.extend(serve_args.iter().cloned());
     let arguments: String = arguments
@@ -22,6 +26,7 @@ pub fn plist(program: &Path, serve_args: &[String], log_path: &Path) -> String {
         .map(|arg| format!("    <string>{}</string>\n", xml_escape(arg)))
         .collect();
     let log = xml_escape(&log_path.to_string_lossy());
+    let home = xml_escape(&home.to_string_lossy());
     format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -32,6 +37,11 @@ pub fn plist(program: &Path, serve_args: &[String], log_path: &Path) -> String {
   <key>ProgramArguments</key>
   <array>
 {arguments}  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>{HOME_ENV}</key>
+    <string>{home}</string>
+  </dict>
   <key>RunAtLoad</key>
   <true/>
   <key>KeepAlive</key>
@@ -70,7 +80,7 @@ fn launchctl(args: &[&str]) -> anyhow::Result<std::process::ExitStatus> {
 }
 
 /// Write the LaunchAgent and (re)start it.
-pub fn install(serve_args: &[String], log_path: &Path) -> anyhow::Result<PathBuf> {
+pub fn install(serve_args: &[String], home: &Path, log_path: &Path) -> anyhow::Result<PathBuf> {
     anyhow::ensure!(
         cfg!(target_os = "macos"),
         "service install is only supported on macOS"
@@ -80,7 +90,7 @@ pub fn install(serve_args: &[String], log_path: &Path) -> anyhow::Result<PathBuf
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    std::fs::write(&path, plist(&program, serve_args, log_path))?;
+    std::fs::write(&path, plist(&program, serve_args, home, log_path))?;
     let domain = gui_domain()?;
     let target = format!("{domain}/{LABEL}");
     // Unload a previous version first; a missing service is fine.
@@ -123,8 +133,10 @@ mod tests {
         let text = plist(
             Path::new("/opt/ego bridge/ego-bridge"),
             &["--allowed-host".to_owned(), "a&b".to_owned()],
+            Path::new("/srv/egb"),
             Path::new("/tmp/log.txt"),
         );
+        assert!(text.contains("<key>EGO_BRIDGE_HOME</key>\n    <string>/srv/egb</string>"));
         assert!(text.contains("<string>/opt/ego bridge/ego-bridge</string>"));
         assert!(text.contains("<string>serve</string>"));
         assert!(text.contains("<string>a&amp;b</string>"));

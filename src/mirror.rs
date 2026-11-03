@@ -80,7 +80,8 @@ pub struct Changes {
 #[derive(Debug)]
 pub struct Mirror {
     root: PathBuf,
-    uploaded: HashMap<PathBuf, [u8; 32]>,
+    /// Size and digest of each uploaded file, to tell unchanged inputs apart.
+    uploaded: HashMap<PathBuf, (u64, [u8; 32])>,
 }
 
 impl Mirror {
@@ -113,7 +114,8 @@ impl Mirror {
                         source,
                     })?;
             fs::write(&path, &bytes).map_err(io_err(format!("write {}", file.path)))?;
-            uploaded.insert(path, digest(&bytes));
+            let size = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+            uploaded.insert(path, (size, digest(&bytes)));
         }
         Ok(Self { root, uploaded })
     }
@@ -141,15 +143,29 @@ impl Mirror {
             let Some(caller) = caller_path(&self.root, entry.path()) else {
                 continue;
             };
-            let bytes = fs::read(entry.path()).map_err(io_err(format!("read {caller}")))?;
-            if self.uploaded.get(entry.path()) == Some(&digest(&bytes)) {
-                continue;
+            let size = entry
+                .metadata()
+                .map_err(|err| MirrorError::Io {
+                    context: format!("stat {caller}"),
+                    source: err.into(),
+                })?
+                .len();
+            // Only an input of the same size can be unchanged; reading it is
+            // bounded by the request size limit.
+            if let Some((uploaded_size, uploaded_digest)) = self.uploaded.get(entry.path())
+                && *uploaded_size == size
+            {
+                let bytes = fs::read(entry.path()).map_err(io_err(format!("read {caller}")))?;
+                if digest(&bytes) == *uploaded_digest {
+                    continue;
+                }
             }
-            let size = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+            // Decide on size before reading so a huge file never enters memory.
             if total.saturating_add(size) > max_total_bytes {
                 changes.skipped.push(caller);
                 continue;
             }
+            let bytes = fs::read(entry.path()).map_err(io_err(format!("read {caller}")))?;
             total += size;
             changes.files.push(FilePayload {
                 path: caller,

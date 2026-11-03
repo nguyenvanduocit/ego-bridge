@@ -240,10 +240,13 @@ async fn run(cli: Cli) -> anyhow::Result<i32> {
         }
         Commands::Client { args } => return run_client(&args).await,
         Commands::Service(ServiceCommand::Install(args)) => {
+            // launchd needs an absolute path; a relative EGO_BRIDGE_HOME would
+            // resolve against a different working directory.
+            let home = std::path::absolute(&home)?;
             let options = serve_options(&args, home.clone())?;
             std::fs::create_dir_all(&home)?;
             let log = home.join("serve.log");
-            let path = service::install(&service_args(&args, &options.ego_browser), &log)?;
+            let path = service::install(&service_args(&args, &options.ego_browser), &home, &log)?;
             eprintln!("Installed {} (logs: {}).", path.display(), log.display());
         }
         Commands::Service(ServiceCommand::Uninstall) => {

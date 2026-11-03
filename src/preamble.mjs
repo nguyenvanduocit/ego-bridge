@@ -12,6 +12,7 @@ import nodePath from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
 const ROOT = __EGO_BRIDGE_MIRROR_ROOT__;
+const SCRIPT_MODULE = __EGO_BRIDGE_SCRIPT_MODULE__;
 const KEY = Symbol.for("ego-bridge.fs");
 
 const isMirrored = (p) => p === ROOT || p.startsWith(ROOT + "/");
@@ -115,10 +116,13 @@ const IDENTIFIER = /^[A-Za-z_$][\w$]*$/;
 // The caller's script is evaluated under a URL ending in `/[eval<n>]` or
 // `/[stdin<n>]` (ego uses `file:////[eval2]`, plain node `file:///<cwd>/[eval1]`).
 // Only its imports are redirected; ego's own SDK keeps the real fs.
+// A script with static imports runs as the module file SCRIPT_MODULE instead.
 const isCallerScript = (parentURL) =>
   typeof parentURL === "string" &&
-  parentURL.startsWith("file:") &&
-  /\/(\[|%5B)(eval|stdin)\d*(\]|%5D)$/i.test(parentURL);
+  ((SCRIPT_MODULE !== null &&
+    parentURL.startsWith("file:") &&
+    fileURLToPath(parentURL) === fileURLToPath(SCRIPT_MODULE)) ||
+    (parentURL.startsWith("file:") && /\/(\[|%5B)(eval|stdin)\d*(\]|%5D)$/i.test(parentURL)));
 
 function moduleSource(kind) {
   const names = Object.keys(globalThis[KEY][kind]).filter((n) => IDENTIFIER.test(n) && n !== "default");

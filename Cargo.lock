@@ -438,7 +438,7 @@ checksum = "d0881ea181b1df73ff77ffaaf9c7544ecc11e82fba9b5f27b262a3c73a332555"
 
 [[package]]
 name = "ego-bridge"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -449,6 +449,7 @@ dependencies = [
  "rand 0.9.5",
  "reqwest",
  "rmcp",
+ "rustix",
  "serde",
  "serde_json",
  "sha2",

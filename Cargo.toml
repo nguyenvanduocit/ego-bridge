@@ -1,6 +1,6 @@
 [package]
 name = "ego-bridge"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.88"
 description = "Share one machine's ego lite browser with agents on other machines over MCP (Streamable HTTP), with a drop-in ego-browser client."
@@ -39,6 +39,9 @@ tokio-util = "0.7"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 walkdir = "2"
+
+[target.'cfg(unix)'.dependencies]
+rustix = { version = "1.1.6", features = ["process"] }
 
 [dev-dependencies]
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }

@@ -59,7 +59,10 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          # Notes are this tag's section of CHANGELOG.md.
+          awk -v tag="## $GITHUB_REF_NAME" '$0 == tag {found=1; next} /^## / {found=0} found' CHANGELOG.md > notes.md
+          test -s notes.md
           gh release create "$GITHUB_REF_NAME" dist/* \
             --title "$GITHUB_REF_NAME" \
-            --notes-file CHANGELOG.md \
+            --notes-file notes.md \
             --verify-tag

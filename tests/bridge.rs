@@ -248,6 +248,41 @@ try {{
 }
 
 #[tokio::test]
+async fn static_fs_imports_use_caller_paths() -> TestResult {
+    let bridge = start_bridge(Duration::from_secs(30)).await?;
+    let work = tempfile::tempdir()?;
+    let work = work.path().canonicalize()?;
+    let input = work.join("in.txt");
+    let hidden = work.join("in.txt.hidden");
+    let output = work.join("out.txt");
+    std::fs::write(&input, "static")?;
+
+    // Static imports are linked before any statement runs; they must still
+    // get the mapped fs. The real input is hidden, so only the mirror has it.
+    let script = format!(
+        r#"import {{ readFileSync, writeFileSync, existsSync }} from "node:fs";
+import {{ readFile }} from "node:fs/promises";
+const real = process.getBuiltinModule("node:fs");
+real.renameSync("{input}", "{hidden}");
+try {{
+  writeFileSync("{output}", readFileSync("{input}", "utf8") + (await readFile("{input}", "utf8")));
+  console.log(JSON.stringify({{ seen: existsSync("{input}"), direct: real.existsSync("{output}") }}));
+}} finally {{
+  real.renameSync("{hidden}", "{input}");
+}}
+"#,
+        input = input.display(),
+        hidden = hidden.display(),
+        output = output.display(),
+    );
+    let run = client(&bridge, &bridge.token, &["nodejs"], Some(&script)).await?;
+    assert_eq!(run.code, Some(0), "stderr: {}", run.stderr);
+    assert_eq!(run.stdout.trim(), r#"{"seen":true,"direct":false}"#);
+    assert_eq!(std::fs::read_to_string(&output)?, "staticstatic");
+    Ok(())
+}
+
+#[tokio::test]
 async fn exit_codes_and_inline_scripts_pass_through() -> TestResult {
     let bridge = start_bridge(Duration::from_secs(30)).await?;
     let run = client(
@@ -269,6 +304,61 @@ async fn exit_codes_and_inline_scripts_pass_through() -> TestResult {
     .await?;
     assert_eq!(thrown.code, Some(1));
     assert!(thrown.stderr.contains("boom"), "{}", thrown.stderr);
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_client_that_disconnects_cancels_its_run() -> TestResult {
+    let bridge = start_bridge(Duration::from_secs(60)).await?;
+    let work = tempfile::tempdir()?;
+    let pid_file = work.path().join("pid");
+    let script = format!(
+        r#"process.getBuiltinModule("node:fs").writeFileSync("{}", String(process.pid));
+await new Promise((r) => setTimeout(r, 60_000));"#,
+        pid_file.display()
+    );
+    let client_home = tempfile::tempdir()?;
+    let mut child = tokio::process::Command::new(env!("CARGO_BIN_EXE_ego-bridge"))
+        .args(["client", "nodejs", "-e", &script])
+        .env("EGO_BRIDGE_HOME", client_home.path())
+        .env("EGO_BRIDGE_URL", &bridge.url)
+        .env("EGO_BRIDGE_TOKEN", &bridge.token)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?;
+
+    let mut pid = None;
+    for _ in 0..100 {
+        if let Ok(text) = std::fs::read_to_string(&pid_file) {
+            pid = text.trim().parse::<i32>().ok();
+            if pid.is_some() {
+                break;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let pid = pid.ok_or("the script never started")?;
+    child.kill().await?;
+
+    let alive = |pid: i32| {
+        std::process::Command::new("kill")
+            .args(["-0", &pid.to_string()])
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success())
+    };
+    let mut stopped = false;
+    for _ in 0..50 {
+        if !alive(pid) {
+            stopped = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(
+        stopped,
+        "host run {pid} kept going after the client disconnected"
+    );
     Ok(())
 }
 

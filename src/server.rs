@@ -15,9 +15,10 @@ use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::tool::Extension;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{CallToolResult, ContentBlock, Implementation, ServerCapabilities, ServerConfig};
+use rmcp::service::RequestContext;
 use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
 use rmcp::transport::streamable_http_server::{StreamableHttpServerConfig, StreamableHttpService};
-use rmcp::{ErrorData, ServerHandler, tool, tool_handler, tool_router};
+use rmcp::{ErrorData, RoleServer, ServerHandler, tool, tool_handler, tool_router};
 use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 
@@ -154,6 +155,7 @@ impl Bridge {
         client: &str,
         server_name: Option<&str>,
         invocation: Result<Invocation, runner::RunError>,
+        cancel: &CancellationToken,
     ) -> Result<CallToolResult, ErrorData> {
         let started = Instant::now();
         let outcome = async {
@@ -162,7 +164,7 @@ impl Bridge {
             let output = self
                 .shared
                 .ego
-                .run(&invocation, self.shared.default_timeout)
+                .run(&invocation, self.shared.default_timeout, cancel)
                 .await
                 .map_err(internal)?;
             Ok::<_, ErrorData>(RunResult {
@@ -196,9 +198,19 @@ impl Bridge {
         }
     }
 
-    async fn run_script(&self, args: &NodejsArgs) -> Result<RunResult, ErrorData> {
+    async fn run_script(
+        &self,
+        args: &NodejsArgs,
+        cancel: &CancellationToken,
+    ) -> Result<RunResult, ErrorData> {
+        if args.timeout_ms == Some(0) {
+            return Err(invalid("timeout_ms must be at least 1"));
+        }
+        // Take a run slot before writing anything, so queued requests do not
+        // fill the disk with mirrors.
+        let _permit = self.shared.runs.acquire().await.map_err(internal)?;
         let run_dir = self.shared.runs_dir.join(run_id());
-        let result = self.run_in(&run_dir, args).await;
+        let result = self.run_in(&run_dir, args, cancel).await;
         match tokio::fs::remove_dir_all(&run_dir).await {
             Ok(()) => {}
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
@@ -209,7 +221,12 @@ impl Bridge {
 
     /// Build the mirror, run the script against it, and collect what the
     /// script wrote.
-    async fn run_in(&self, run_dir: &Path, args: &NodejsArgs) -> Result<RunResult, ErrorData> {
+    async fn run_in(
+        &self,
+        run_dir: &Path,
+        args: &NodejsArgs,
+        cancel: &CancellationToken,
+    ) -> Result<RunResult, ErrorData> {
         let mirror_root = run_dir.join("fs");
         let (files, dirs) = (args.files.clone(), args.dirs.clone());
         let mirror =
@@ -218,26 +235,43 @@ impl Bridge {
                 .map_err(internal)?
                 .map_err(mirror_error)?;
 
-        let source = preamble::render(mirror.root()).map_err(internal)?;
+        // Static imports are linked before any statement runs, so such a
+        // script is written to a module file and imported after the preamble.
+        let as_module = runner::has_static_imports(&args.script)
+            && !args.print
+            && args.input_type.as_deref() != Some("commonjs");
+        let module_file = as_module.then(|| {
+            run_dir.join(if args.strip_types {
+                "script.mts"
+            } else {
+                "script.mjs"
+            })
+        });
+        if let Some(file) = &module_file {
+            tokio::fs::write(file, &args.script)
+                .await
+                .map_err(internal)?;
+        }
+        let module_url = module_file.as_deref().map(runner::file_url);
+        let source = preamble::render(mirror.root(), module_url.as_deref()).map_err(internal)?;
         let preamble_path = run_dir.join("preamble.mjs");
         tokio::fs::write(&preamble_path, source)
             .await
             .map_err(internal)?;
-        let invocation = runner::nodejs(args, &preamble_path).map_err(invalid)?;
+        let invocation =
+            runner::nodejs(args, &preamble_path, module_file.as_deref()).map_err(invalid)?;
         let timeout = args
             .timeout_ms
             .map(Duration::from_millis)
             .unwrap_or(self.shared.default_timeout)
             .min(self.shared.max_timeout);
 
-        let output = {
-            let _permit = self.shared.runs.acquire().await.map_err(internal)?;
-            self.shared
-                .ego
-                .run(&invocation, timeout)
-                .await
-                .map_err(internal)?
-        };
+        let output = self
+            .shared
+            .ego
+            .run(&invocation, timeout, cancel)
+            .await
+            .map_err(internal)?;
 
         let cap = self.shared.max_output_file_bytes;
         let changes = tokio::task::spawn_blocking(move || mirror.changes(cap))
@@ -287,11 +321,18 @@ impl Bridge {
         &self,
         Parameters(args): Parameters<ServerArgs>,
         Extension(parts): Extension<http::request::Parts>,
+        context: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
         let client = client_name(&parts);
         let server_name = args.server_name.as_deref();
-        self.run_simple("skill", &client, server_name, runner::skill(server_name))
-            .await
+        self.run_simple(
+            "skill",
+            &client,
+            server_name,
+            runner::skill(server_name),
+            &context.ct,
+        )
+        .await
     }
 
     #[tool(description = "Same as `ego-browser help [topic]`.")]
@@ -299,6 +340,7 @@ impl Bridge {
         &self,
         Parameters(args): Parameters<HelpArgs>,
         Extension(parts): Extension<http::request::Parts>,
+        context: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
         let client = client_name(&parts);
         self.run_simple(
@@ -306,6 +348,7 @@ impl Bridge {
             &client,
             args.server_name.as_deref(),
             runner::help(&args),
+            &context.ct,
         )
         .await
     }
@@ -317,6 +360,7 @@ impl Bridge {
         &self,
         Parameters(args): Parameters<ServerArgs>,
         Extension(parts): Extension<http::request::Parts>,
+        context: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
         let client = client_name(&parts);
         let server_name = args.server_name.as_deref();
@@ -325,6 +369,7 @@ impl Bridge {
             &client,
             server_name,
             runner::version(server_name),
+            &context.ct,
         )
         .await
     }
@@ -336,10 +381,11 @@ impl Bridge {
         &self,
         Parameters(args): Parameters<NodejsArgs>,
         Extension(parts): Extension<http::request::Parts>,
+        context: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
         let client = client_name(&parts);
         let started = Instant::now();
-        let outcome = self.run_script(&args).await;
+        let outcome = self.run_script(&args, &context.ct).await;
         let error = outcome.as_ref().err().map(|err| err.message.to_string());
         let files_out: Vec<&str> = outcome
             .as_ref()
@@ -452,6 +498,9 @@ pub fn app(options: &ServeOptions, cancel: CancellationToken) -> std::io::Result
     let mcp_config = StreamableHttpServerConfig::default()
         .with_allowed_hosts(hosts)
         .with_sse_keep_alive(Some(Duration::from_secs(15)))
+        // Stateless: every call stands alone, and a client that disconnects
+        // cancels its run (rmcp only cancels on disconnect without sessions).
+        .with_legacy_session_mode(false)
         .with_cancellation_token(cancel.child_token());
     let mut mcp_config = mcp_config;
     mcp_config.max_request_body_bytes = options.max_request_bytes;

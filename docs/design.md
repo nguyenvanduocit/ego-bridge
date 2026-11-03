@@ -50,7 +50,14 @@ Per run, the host creates `runs/<id>/fs/` (the mirror) and maps caller path
      friends disappear.
    - Not `await import()`: top-level await makes Node treat the input as ESM,
      which breaks `--print`.
-   - Same line, so error line numbers match the caller's script.
+   - Same line, so error line numbers match the caller's script. A hashbang
+     line and a leading `"use strict"` directive stay in front of it.
+   - Scripts with static `import`/`export` declarations are different: Node
+     resolves and links static imports before any statement runs, so the hook
+     would come too late. Such a script is written to `runs/<id>/script.mjs`
+     (`.mts` with `--strip-types`) and stdin becomes
+     `<loader>await import("<file url>");`. The preamble treats that module URL
+     as the caller's script.
 3. Preamble (`src/preamble.mjs`):
    - `module.registerHooks` redirects `fs` / `fs/promises` imports made by the
      caller's script (parent URL ends in `/[eval<n>]` or `/[stdin<n>]`) to
@@ -63,6 +70,20 @@ Per run, the host creates `runs/<id>/fs/` (the mirror) and maps caller path
 4. Host: return every new or changed file (by SHA-256 against what was
    uploaded), within the output cap, then delete the run folder.
 
+## Run lifecycle
+
+- A run slot (`--max-concurrent-runs`) is taken before the mirror is written,
+  so queued requests cost no disk.
+- `ego-browser` runs as the leader of its own process group. When the run ends
+  (exit, time limit, or cancellation) the whole group is killed with
+  `killpg`, so background processes cannot outlive it or hold its pipes. Output
+  is then read for at most two more seconds, for processes that left the group.
+- The MCP endpoint is stateless (no sessions): rmcp cancels a request when its
+  client disconnects only in that mode, and the run is cancelled with it
+  (exit code 130).
+- Output files are size-checked before they are read, so the output cap also
+  bounds memory.
+
 ## Verified behaviour (ego lite 0.6.2.5, macOS)
 
 - `console.log`, `--version` and `help` output goes to stderr in the real CLI,
@@ -73,6 +94,9 @@ Per run, the host creates `runs/<id>/fs/` (the mirror) and maps caller path
   on the client.
 - Through `tailscale serve`, requests are rejected until the tailnet hostname
   is passed with `--allowed-host`.
+- Static `import { writeFileSync } from "node:fs"`, a hashbang, `--strip-types`
+  and a `"use strict"` CommonJS script all behave as with the local CLI.
+- Killing the client mid-run stops the host run (exit 130).
 
 ## Upgrade risk
 

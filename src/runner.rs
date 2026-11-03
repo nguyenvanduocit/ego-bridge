@@ -4,10 +4,12 @@
 
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::process::Command;
+use tokio_util::sync::CancellationToken;
 
 use crate::protocol::{HelpArgs, NodejsArgs};
 
@@ -87,11 +89,11 @@ pub fn help(args: &HelpArgs) -> Result<Invocation, RunError> {
     })
 }
 
-/// Statement that loads the preamble, put on the script's first line.
+/// Statement that loads the preamble.
 ///
 /// `--sdk-path` cannot carry the preamble because it replaces ego's own SDK.
 /// A synchronous `require` (Node loads ESM through it) works in module,
-/// CommonJS and `--print` modes alike, and keeps the script's line numbers.
+/// CommonJS and `--print` modes alike.
 pub fn preamble_loader(preamble: &Path) -> Result<String, serde_json::Error> {
     let path = serde_json::to_string(&preamble.to_string_lossy())?;
     Ok(format!(
@@ -99,9 +101,82 @@ pub fn preamble_loader(preamble: &Path) -> Result<String, serde_json::Error> {
     ))
 }
 
-/// The script goes through stdin, which ego-browser accepts up to 64 MiB and
-/// which avoids command-line length limits.
-pub fn nodejs(args: &NodejsArgs, preamble: &Path) -> Result<Invocation, RunError> {
+/// Put `loader` in front of the script's code without moving any line: after
+/// a hashbang line and after a leading `"use strict"` directive, both of which
+/// must stay first to keep their meaning.
+pub fn with_loader(script: &str, loader: &str) -> String {
+    let (hashbang, body) = if script.starts_with("#!") {
+        match script.find('\n') {
+            Some(end) => script.split_at(end + 1),
+            None => (script, ""),
+        }
+    } else {
+        ("", script)
+    };
+    let newline = if !hashbang.is_empty() && !hashbang.ends_with('\n') {
+        "\n"
+    } else {
+        ""
+    };
+    let (directive, rest) = split_use_strict(body);
+    let separator = if !directive.is_empty() && !directive.ends_with(';') {
+        ";"
+    } else {
+        ""
+    };
+    format!("{hashbang}{newline}{directive}{separator}{loader}{rest}")
+}
+
+fn split_use_strict(body: &str) -> (&str, &str) {
+    let start = body.len() - body.trim_start().len();
+    for literal in ["\"use strict\"", "'use strict'"] {
+        if body[start..].starts_with(literal) {
+            let mut end = start + literal.len();
+            if body[end..].starts_with(';') {
+                end += 1;
+            }
+            return body.split_at(end);
+        }
+    }
+    ("", body)
+}
+
+/// Whether the script has static `import`/`export` declarations. Node links
+/// those before any statement runs, so the preamble's import hook would come
+/// too late; such scripts are loaded as a module file after the preamble.
+pub fn has_static_imports(script: &str) -> bool {
+    script.lines().any(|line| {
+        let line = line.trim_start();
+        let import = line
+            .strip_prefix("import")
+            .is_some_and(|rest| rest.starts_with([' ', '\t', '{', '*', '"', '\'']));
+        import || line.starts_with("export ") || line.starts_with("export{")
+    })
+}
+
+/// `file://` URL for an absolute path.
+pub fn file_url(path: &Path) -> String {
+    let mut url = String::from("file://");
+    for byte in path.to_string_lossy().bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b'-' | b'_' | b'.' | b'~') {
+            url.push(char::from(byte));
+        } else {
+            url.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    url
+}
+
+/// Build the `ego-browser nodejs` call. The script goes through stdin, which
+/// ego-browser accepts up to 64 MiB and which avoids command-line limits.
+///
+/// With `module_file`, the caller has written the script there and stdin only
+/// loads the preamble and then imports that file.
+pub fn nodejs(
+    args: &NodejsArgs,
+    preamble: &Path,
+    module_file: Option<&Path>,
+) -> Result<Invocation, RunError> {
     let loader = preamble_loader(preamble).map_err(|err| RunError::Io(err.into()))?;
     let mut argv = with_server(args.server_name.as_deref(), &["nodejs"])?;
     if args.print {
@@ -113,16 +188,37 @@ pub fn nodejs(args: &NodejsArgs, preamble: &Path) -> Result<Invocation, RunError
     if let Some(input_type) = args.input_type.as_deref() {
         argv.push(format!("--input-type={input_type}"));
     }
+    let stdin = match module_file {
+        Some(file) => {
+            let url =
+                serde_json::to_string(&file_url(file)).map_err(|err| RunError::Io(err.into()))?;
+            format!("{loader}await import({url});")
+        }
+        None => with_loader(&args.script, &loader),
+    };
     Ok(Invocation {
         args: argv,
-        stdin: Some(format!("{loader}{}", args.script)),
+        stdin: Some(stdin),
     })
 }
+
+/// How long to keep reading output after the run ended, for processes that
+/// left the run's process group but still hold its stdout or stderr.
+const PIPE_GRACE: Duration = Duration::from_secs(2);
+
+/// Exit code reported when the caller cancelled the run, as for Ctrl-C.
+pub const CANCELLED_EXIT_CODE: i32 = 130;
 
 #[derive(Debug, Clone)]
 pub struct EgoBrowser {
     bin: PathBuf,
     max_stream_bytes: usize,
+}
+
+enum Ended {
+    Exited(std::process::ExitStatus),
+    TimedOut,
+    Cancelled,
 }
 
 impl EgoBrowser {
@@ -133,14 +229,13 @@ impl EgoBrowser {
         }
     }
 
-    pub fn bin(&self) -> &Path {
-        &self.bin
-    }
-
+    /// Run `invocation` until it exits, hits `timeout`, or `cancel` fires.
+    /// Every process left in the run's process group is killed when it ends.
     pub async fn run(
         &self,
         invocation: &Invocation,
         timeout: Duration,
+        cancel: &CancellationToken,
     ) -> Result<Output, RunError> {
         let mut command = Command::new(&self.bin);
         command
@@ -159,6 +254,8 @@ impl EgoBrowser {
             bin: self.bin.clone(),
             source,
         })?;
+        // The group id outlives the leader, so keep it for after `wait`.
+        let group = child.id();
 
         let stdin_task = match (child.stdin.take(), invocation.stdin.clone()) {
             (Some(mut pipe), Some(text)) => Some(tokio::spawn(async move {
@@ -167,64 +264,89 @@ impl EgoBrowser {
             })),
             _ => None,
         };
-        let stdout = child
-            .stdout
-            .take()
-            .map(|pipe| tokio::spawn(read_capped(pipe, self.max_stream_bytes)));
-        let stderr = child
-            .stderr
-            .take()
-            .map(|pipe| tokio::spawn(read_capped(pipe, self.max_stream_bytes)));
+        let stdout = Arc::new(Mutex::new(Capped::new(self.max_stream_bytes)));
+        let stderr = Arc::new(Mutex::new(Capped::new(self.max_stream_bytes)));
+        let mut readers = Vec::new();
+        if let Some(pipe) = child.stdout.take() {
+            readers.push(tokio::spawn(pump(pipe, Arc::clone(&stdout))));
+        }
+        if let Some(pipe) = child.stderr.take() {
+            readers.push(tokio::spawn(pump(pipe, Arc::clone(&stderr))));
+        }
 
-        let (status, timed_out) = match tokio::time::timeout(timeout, child.wait()).await {
-            Ok(status) => (Some(status?), false),
-            Err(_) => {
-                kill_group(&mut child).await;
-                (None, true)
-            }
+        let ended = tokio::select! {
+            status = child.wait() => Ended::Exited(status?),
+            () = tokio::time::sleep(timeout) => Ended::TimedOut,
+            () = cancel.cancelled() => Ended::Cancelled,
         };
+        kill_group(group);
+        if !matches!(ended, Ended::Exited(_)) {
+            // Also reaps the child.
+            let _ = child.kill().await;
+        }
         if let Some(task) = stdin_task {
             // A script that exits early closes stdin; that is not an error.
-            let _ = task.await;
+            task.abort();
         }
-        let stdout = join_stream(stdout).await?;
-        let mut stderr = join_stream(stderr).await?;
-        if timed_out {
+        let drained = tokio::time::timeout(PIPE_GRACE, async {
+            for reader in &mut readers {
+                let _ = reader.await;
+            }
+        })
+        .await
+        .is_ok();
+        for reader in &readers {
+            reader.abort();
+        }
+
+        let stdout = take_text(&stdout);
+        let mut stderr = take_text(&stderr);
+        let mut note = |line: String| {
             if !stderr.is_empty() && !stderr.ends_with('\n') {
                 stderr.push('\n');
             }
-            stderr.push_str(&format!(
-                "ego-bridge: run stopped after {}s time limit\n",
-                timeout.as_secs()
-            ));
+            stderr.push_str(&line);
+        };
+        if !drained {
+            note("ego-bridge: a detached process kept the output open; later output is not included\n".to_owned());
         }
+        let exit_code = match ended {
+            Ended::Exited(status) => exit_code(status),
+            Ended::TimedOut => {
+                note(format!(
+                    "ego-bridge: run stopped after its {} time limit\n",
+                    humantime::format_duration(timeout)
+                ));
+                TIMEOUT_EXIT_CODE
+            }
+            Ended::Cancelled => {
+                note("ego-bridge: run cancelled by the caller\n".to_owned());
+                CANCELLED_EXIT_CODE
+            }
+        };
         Ok(Output {
-            exit_code: status.map_or(TIMEOUT_EXIT_CODE, exit_code),
+            exit_code,
             stdout,
             stderr,
-            timed_out,
+            timed_out: matches!(ended, Ended::TimedOut),
         })
     }
 }
 
+/// Kill every process in the group led by `leader`. Errors mean the group is
+/// already gone.
 #[cfg(unix)]
-async fn kill_group(child: &mut tokio::process::Child) {
-    if let Some(pid) = child.id() {
-        // Signal the whole group so helpers ego-browser started die with it.
-        // POSIX form; procps `kill` would read a bare `-<pid>` as a signal.
-        let _ = Command::new("kill")
-            .args(["-s", "KILL", "--"])
-            .arg(format!("-{pid}"))
-            .status()
-            .await;
+fn kill_group(leader: Option<u32>) {
+    let pid = leader
+        .and_then(|pid| i32::try_from(pid).ok())
+        .and_then(rustix::process::Pid::from_raw);
+    if let Some(pid) = pid {
+        let _ = rustix::process::kill_process_group(pid, rustix::process::Signal::KILL);
     }
-    let _ = child.kill().await;
 }
 
 #[cfg(not(unix))]
-async fn kill_group(child: &mut tokio::process::Child) {
-    let _ = child.kill().await;
-}
+fn kill_group(_leader: Option<u32>) {}
 
 fn exit_code(status: std::process::ExitStatus) -> i32 {
     if let Some(code) = status.code() {
@@ -240,45 +362,68 @@ fn exit_code(status: std::process::ExitStatus) -> i32 {
     1
 }
 
-async fn join_stream(
-    task: Option<tokio::task::JoinHandle<std::io::Result<String>>>,
-) -> Result<String, RunError> {
-    match task {
-        Some(task) => task
-            .await
-            .map_err(|err| RunError::Io(std::io::Error::other(err)))?
-            .map_err(RunError::Io),
-        None => Ok(String::new()),
+/// Output kept up to a byte cap, counting what was dropped.
+#[derive(Debug)]
+struct Capped {
+    kept: Vec<u8>,
+    dropped: usize,
+    cap: usize,
+}
+
+impl Capped {
+    fn new(cap: usize) -> Self {
+        Self {
+            kept: Vec::new(),
+            dropped: 0,
+            cap,
+        }
+    }
+
+    fn push(&mut self, chunk: &[u8]) {
+        let take = self.cap.saturating_sub(self.kept.len()).min(chunk.len());
+        self.kept.extend_from_slice(&chunk[..take]);
+        self.dropped += chunk.len() - take;
+    }
+
+    fn text(&self) -> String {
+        let mut text = String::from_utf8_lossy(&self.kept).into_owned();
+        if self.dropped > 0 {
+            text.push_str(&format!(
+                "\n[ego-bridge: output truncated, {} bytes dropped]\n",
+                self.dropped
+            ));
+        }
+        text
     }
 }
 
-/// Read a stream to the end, keeping at most `cap` bytes.
-async fn read_capped(mut reader: impl AsyncRead + Unpin, cap: usize) -> std::io::Result<String> {
-    let mut kept = Vec::new();
-    let mut dropped: usize = 0;
-    let mut buf = [0_u8; 64 * 1024];
+fn take_text(buffer: &Mutex<Capped>) -> String {
+    buffer.lock().unwrap_or_else(PoisonError::into_inner).text()
+}
+
+/// Copy a stream into `buffer` until it ends.
+async fn pump(
+    mut reader: impl AsyncRead + Unpin,
+    buffer: Arc<Mutex<Capped>>,
+) -> std::io::Result<()> {
+    let mut chunk = [0_u8; 64 * 1024];
     loop {
-        let read = reader.read(&mut buf).await?;
+        let read = reader.read(&mut chunk).await?;
         if read == 0 {
-            break;
+            return Ok(());
         }
-        let room = cap.saturating_sub(kept.len());
-        let take = room.min(read);
-        kept.extend_from_slice(&buf[..take]);
-        dropped += read - take;
+        buffer
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(&chunk[..read]);
     }
-    let mut text = String::from_utf8_lossy(&kept).into_owned();
-    if dropped > 0 {
-        text.push_str(&format!(
-            "\n[ego-bridge: output truncated, {dropped} bytes dropped]\n"
-        ));
-    }
-    Ok(text)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const LOADER: &str = "L;";
 
     #[test]
     fn builds_cli_arguments_like_ego_browser() -> Result<(), RunError> {
@@ -299,7 +444,7 @@ mod tests {
             input_type: Some("module".to_owned()),
             ..NodejsArgs::default()
         };
-        let invocation = nodejs(&run, Path::new("/runs/1/preamble.mjs"))?;
+        let invocation = nodejs(&run, Path::new("/runs/1/preamble.mjs"), None)?;
         assert_eq!(
             invocation.args,
             vec!["nodejs", "--print", "--input-type=module"]
@@ -315,6 +460,63 @@ mod tests {
     }
 
     #[test]
+    fn module_scripts_are_imported_after_the_preamble() -> Result<(), RunError> {
+        let run = NodejsArgs {
+            script: "import fs from \"node:fs\";".to_owned(),
+            ..NodejsArgs::default()
+        };
+        let invocation = nodejs(
+            &run,
+            Path::new("/runs/1/preamble.mjs"),
+            Some(Path::new("/runs/1/my script.mjs")),
+        )?;
+        let stdin = invocation.stdin.unwrap_or_default();
+        assert!(
+            stdin.ends_with("await import(\"file:///runs/1/my%20script.mjs\");"),
+            "{stdin}"
+        );
+        assert!(!stdin.contains("node:fs"));
+        Ok(())
+    }
+
+    #[test]
+    fn loader_keeps_hashbang_and_use_strict_first() {
+        assert_eq!(with_loader("a()\nb()", LOADER), "L;a()\nb()");
+        assert_eq!(
+            with_loader("#!/usr/bin/env node\na()", LOADER),
+            "#!/usr/bin/env node\nL;a()"
+        );
+        assert_eq!(
+            with_loader("#!/usr/bin/env node", LOADER),
+            "#!/usr/bin/env node\nL;"
+        );
+        assert_eq!(
+            with_loader("\"use strict\";\na()", LOADER),
+            "\"use strict\";L;\na()"
+        );
+        assert_eq!(
+            with_loader("'use strict'\na()", LOADER),
+            "'use strict';L;\na()"
+        );
+        assert_eq!(
+            with_loader("#!/bin/node\n  'use strict';x", LOADER),
+            "#!/bin/node\n  'use strict';L;x"
+        );
+    }
+
+    #[test]
+    fn detects_static_imports_and_exports_only() {
+        assert!(has_static_imports("import fs from \"node:fs\";"));
+        assert!(has_static_imports("const a = 1;\n  import { x } from 'y';"));
+        assert!(has_static_imports("import * as p from \"node:path\""));
+        assert!(has_static_imports("import \"side-effect\";"));
+        assert!(has_static_imports("export const a = 1;"));
+        assert!(!has_static_imports("const fs = await import(\"node:fs\");"));
+        assert!(!has_static_imports("console.log(import.meta.url)"));
+        assert!(!has_static_imports("const important = 1;"));
+    }
+
+    #[test]
     fn rejects_server_names_that_could_smuggle_arguments() {
         for bad in ["", "a b", "x --version", "a/b", &"x".repeat(65)] {
             assert!(
@@ -325,14 +527,28 @@ mod tests {
     }
 
     #[cfg(unix)]
+    fn sh(script: &str) -> Invocation {
+        Invocation {
+            args: vec!["-c".to_owned(), script.to_owned()],
+            stdin: None,
+        }
+    }
+
+    #[cfg(unix)]
     #[tokio::test]
     async fn captures_output_exit_code_and_stdin() -> Result<(), Box<dyn std::error::Error>> {
         let ego = EgoBrowser::new(PathBuf::from("/bin/sh"), 1024);
         let invocation = Invocation {
-            args: vec!["-c".to_owned(), "cat; echo err >&2; exit 3".to_owned()],
             stdin: Some("hello".to_owned()),
+            ..sh("cat; echo err >&2; exit 3")
         };
-        let output = ego.run(&invocation, Duration::from_secs(10)).await?;
+        let output = ego
+            .run(
+                &invocation,
+                Duration::from_secs(10),
+                &CancellationToken::new(),
+            )
+            .await?;
         assert_eq!(output.exit_code, 3);
         assert_eq!(output.stdout, "hello");
         assert_eq!(output.stderr, "err\n");
@@ -344,16 +560,71 @@ mod tests {
     #[tokio::test]
     async fn stops_runs_that_exceed_the_time_limit() -> Result<(), Box<dyn std::error::Error>> {
         let ego = EgoBrowser::new(PathBuf::from("/bin/sh"), 1024);
-        let invocation = Invocation {
-            args: vec!["-c".to_owned(), "sleep 30".to_owned()],
-            stdin: None,
-        };
+        // The background `sleep` is a second process in the group holding
+        // stdout open: the whole group must die, not only the shell.
         let started = std::time::Instant::now();
-        let output = ego.run(&invocation, Duration::from_millis(300)).await?;
-        assert!(started.elapsed() < Duration::from_secs(5));
+        let output = ego
+            .run(
+                &sh("sleep 30 & sleep 30"),
+                Duration::from_millis(1500),
+                &CancellationToken::new(),
+            )
+            .await?;
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "{:?}",
+            started.elapsed()
+        );
         assert!(output.timed_out);
         assert_eq!(output.exit_code, TIMEOUT_EXIT_CODE);
-        assert!(output.stderr.contains("time limit"));
+        assert!(
+            output.stderr.contains("after its 1s 500ms time limit"),
+            "{}",
+            output.stderr
+        );
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn background_processes_do_not_outlive_a_finished_run()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let ego = EgoBrowser::new(PathBuf::from("/bin/sh"), 1024);
+        let started = std::time::Instant::now();
+        let output = ego
+            .run(
+                &sh("sleep 30 & echo done"),
+                Duration::from_secs(60),
+                &CancellationToken::new(),
+            )
+            .await?;
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "{:?}",
+            started.elapsed()
+        );
+        assert_eq!(output.exit_code, 0);
+        assert_eq!(output.stdout, "done\n");
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cancelling_stops_the_run() -> Result<(), Box<dyn std::error::Error>> {
+        let ego = EgoBrowser::new(PathBuf::from("/bin/sh"), 1024);
+        let cancel = CancellationToken::new();
+        let trigger = cancel.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            trigger.cancel();
+        });
+        let started = std::time::Instant::now();
+        let output = ego
+            .run(&sh("sleep 30"), Duration::from_secs(60), &cancel)
+            .await?;
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert_eq!(output.exit_code, CANCELLED_EXIT_CODE);
+        assert!(output.stderr.contains("cancelled"));
         Ok(())
     }
 
@@ -361,11 +632,13 @@ mod tests {
     #[tokio::test]
     async fn truncates_oversized_output() -> Result<(), Box<dyn std::error::Error>> {
         let ego = EgoBrowser::new(PathBuf::from("/bin/sh"), 10);
-        let invocation = Invocation {
-            args: vec!["-c".to_owned(), "printf 'abcdefghijklmnop'".to_owned()],
-            stdin: None,
-        };
-        let output = ego.run(&invocation, Duration::from_secs(10)).await?;
+        let output = ego
+            .run(
+                &sh("printf 'abcdefghijklmnop'"),
+                Duration::from_secs(10),
+                &CancellationToken::new(),
+            )
+            .await?;
         assert!(
             output
                 .stdout

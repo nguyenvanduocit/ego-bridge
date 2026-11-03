@@ -2,6 +2,8 @@
 
 Use one machine's ego lite browser (Citro Labs) from agents on other machines.
 
+ego-bridge is an independent project, not affiliated with or endorsed by Citro Labs.
+
 ego lite runs on one Mac. Its `ego-browser` command talks to the app over macOS
 Mach IPC, which only works on that machine. `ego-bridge` puts an authenticated
 MCP server (Streamable HTTP) in front of it, and ships a drop-in `ego-browser`
@@ -34,6 +36,11 @@ What is different:
 - The interactive REPL and `nodejs --sdk-path` are not available.
 - Output arrives when the script ends, not while it runs.
 - `localhost` in a script means the host, not the client.
+- A script with static `import`/`export` declarations runs as a module file on
+  the host, so stack traces name that file instead of `[eval]` (line numbers
+  are unchanged).
+- Processes a script leaves running in the background are stopped when the
+  script ends. Stopping the client (Ctrl-C) stops the run on the host.
 
 ### How file paths work
 
